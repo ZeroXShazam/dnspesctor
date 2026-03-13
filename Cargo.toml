@@ -1,0 +1,18 @@
+[package]
+name = "rust-dns"
+version = "0.1.0"
+edition = "2021"
+description = "TCP-over-DNS tunnel: client listens on TCP, server forwards to destination via DNS TXT"
+
+[[bin]]
+name = "rust-dns"
+path = "rust-dns.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+hickory-proto = "0.24"
+base64 = { version = "0.21", default-features = false, features = ["std"] }
+rand = "0.8"
+hex = "0.4"
