@@ -1,0 +1,3 @@
+# Use project-local target directory so the release binary ends up in target/release/
+[build]
+target-dir = "target"

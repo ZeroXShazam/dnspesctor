@@ -23,17 +23,17 @@ use tokio::net::UdpSocket;
 const CHUNK_SIZE: usize = 40; // fits in one DNS label as base64 (~54 chars)
 const POLL_SEQ: u32 = 0;
 
+/// Encode data for DNS query labels. Uses hex so label survives DNS case normalization.
 fn encode_data_label(data: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(data)
+    hex::encode(data)
 }
 
 fn decode_data_label(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .map_err(|e| e.into())
+    hex::decode(s.trim()).map_err(|e| e.into())
 }
 
 /// Build query name: [data_labels...].seq.stream_id.domain
+/// Labels use hex (case-insensitive) so DNS case normalization doesn't corrupt.
 fn build_query_name(stream_id: &str, seq: u32, data: &[u8], domain: &str) -> String {
     let mut labels = Vec::new();
     if seq != POLL_SEQ && !data.is_empty() {
@@ -50,7 +50,8 @@ fn build_query_name(stream_id: &str, seq: u32, data: &[u8], domain: &str) -> Str
 /// Parse query name: domain.stream_id.seq.[data_labels...]
 /// Returns (stream_id, seq, data)
 fn parse_query_name(qname: &str, domain: &str) -> Option<(String, u32, Vec<u8>)> {
-    let suffix = format!(".{}", domain);
+    let qname = qname.trim_end_matches('.'); // DNS often returns FQDN with trailing dot
+    let suffix = format!(".{}", domain.trim_end_matches('.'));
     let qname = qname.strip_suffix(&suffix)?;
     let parts: Vec<&str> = qname.split('.').collect();
     if parts.len() < 2 {
@@ -92,8 +93,8 @@ fn decode_response_txt(txt: &str) -> Option<(u32, Vec<u8>)> {
 // ============== CLI ==============
 
 #[derive(Parser, Debug)]
-#[command(name = "dns-tunnel")]
-#[command(about = "TCP-over-DNS tunnel: client and server")]
+#[command(name = "rust-dns")]
+#[command(about = "dnspector — TCP-over-DNS tunnel: client and server")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -134,6 +135,23 @@ enum Commands {
         #[arg(long, short = 't', required = true)]
         destination: String,
     },
+
+    /// Run server + client locally and verify data flows (no root, no nc needed)
+    LocalTest,
+
+    /// Probe server: send one TXT query and check if UDP port responds (reachability)
+    Probe {
+        /// DNS server IP (e.g. 5.199.162.55)
+        #[arg(long, short = 'd', required = true)]
+        dns_server: String,
+
+        /// Domain the server is configured for (e.g. t.decycle.io)
+        #[arg(long, short = 'm', required = true)]
+        domain: String,
+
+        #[arg(long, default_value = "53")]
+        dns_port: u16,
+    },
 }
 
 #[tokio::main]
@@ -159,6 +177,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             domain,
             destination,
         } => run_server(&bind, &domain, &destination).await?,
+        Commands::LocalTest => run_local_test().await?,
+        Commands::Probe {
+            dns_server,
+            domain,
+            dns_port,
+        } => run_probe(&dns_server, &domain, dns_port).await?,
     }
     Ok(())
 }
@@ -191,7 +215,7 @@ async fn run_server(
         let (len, src) = socket.recv_from(&mut buf).await?;
         let req = match Message::from_vec(&buf[..len]) {
             Ok(r) => r,
-            _ => continue,
+            Err(_) => continue,
         };
 
         let mut resp = Message::new();
@@ -212,16 +236,16 @@ async fn run_server(
                             let _ = st.lock().await.tx.send((seq, data));
                         }
                         let txt = take_next_buffered(&st).await;
-                    let name = Name::from_utf8(&qname)?;
-                    let mut record = Record::new();
-                    record.set_name(name);
-                    record.set_ttl(1);
-                    record.set_rr_type(RecordType::TXT);
-                    record.set_data(Some(RData::TXT(TXT::new(vec![txt]))));
-                    resp.add_answer(record);
+                        let name = Name::from_utf8(&qname)?;
+                        let mut record = Record::new();
+                        record.set_name(name);
+                        record.set_ttl(1);
+                        record.set_rr_type(RecordType::TXT);
+                        record.set_data(Some(RData::TXT(TXT::new(vec![txt]))));
+                        resp.add_answer(record);
+                    }
                 }
             }
-        }
 
         resp.set_response_code(ResponseCode::NoError);
         let mut out = Vec::with_capacity(512);
@@ -325,6 +349,149 @@ async fn take_next_buffered(state: &Arc<Mutex<StreamState>>) -> String {
     "OK".to_string()
 }
 
+// ============== Local test ==============
+
+const LOCAL_DNS: &str = "127.0.0.1:5353";
+const LOCAL_DEST: &str = "127.0.0.1:8080";
+const LOCAL_CLIENT: &str = "127.0.0.1:1080";
+const LOCAL_DOMAIN: &str = "t.decycle.io";
+
+async fn run_local_test() -> Result<(), Box<dyn std::error::Error>> {
+    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let dest_listener = TcpListener::bind(LOCAL_DEST).await?;
+    let received_clone = received.clone();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = dest_listener.accept().await {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => received_clone.lock().await.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let _ = run_server(LOCAL_DNS, LOCAL_DOMAIN, LOCAL_DEST).await;
+    });
+    tokio::spawn(async move {
+        let _ = run_client(
+            LOCAL_CLIENT,
+            &["127.0.0.1".to_string()],
+            &[LOCAL_DOMAIN.to_string()],
+            5353,
+        )
+        .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut client = TcpStream::connect(LOCAL_CLIENT).await?;
+    client.write_all(b"hello\n").await?;
+    client.shutdown().await?;
+    drop(client);
+
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r = received.lock().await.clone();
+        if r == b"hello\n" {
+            println!("local-test OK: data reached destination");
+            return Ok(());
+        }
+        if !r.is_empty() {
+            println!("local-test partial: got {:?}", String::from_utf8_lossy(&r));
+        }
+    }
+
+    let r = received.lock().await.clone();
+    eprintln!("local-test FAIL: expected b\"hello\\n\", got {} bytes: {:?}", r.len(), String::from_utf8_lossy(&r));
+    Err("local test failed".into())
+}
+
+// ============== Resolve server address ==============
+
+/// Resolve -d argument to an IP: use as-is if already an IP, else resolve hostname via system DNS.
+async fn resolve_dns_server(host: &str) -> Result<std::net::IpAddr, Box<dyn std::error::Error>> {
+    let host = host.trim();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(ip);
+    }
+    let bootstrap = TokioAsyncResolver::tokio(
+        ResolverConfig::google(),
+        ResolverOpts::default(),
+    );
+    let addrs = bootstrap
+        .lookup_ip(host)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("resolve {}: {}", host, e))) })?;
+    let ip = addrs
+        .iter()
+        .next()
+        .ok_or_else(|| -> Box<dyn std::error::Error> { Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no address for {}", host))) })?
+        .to_owned();
+    Ok(ip)
+}
+
+// ============== Probe ==============
+
+async fn run_probe(
+    dns_server: &str,
+    domain: &str,
+    dns_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ip = resolve_dns_server(dns_server).await?;
+    let resolver = TokioAsyncResolver::tokio(
+        ResolverConfig::from_parts(
+            None,
+            vec![],
+            NameServerConfigGroup::from_ips_clear(&[ip], dns_port, true),
+        ),
+        ResolverOpts::default(),
+    );
+    let name = build_query_name("probe0001", POLL_SEQ, &[], domain);
+    println!("probe: sending TXT query to {} ({}):{} for {:?}", dns_server, ip, dns_port, name);
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        resolver.txt_lookup(name),
+    )
+    .await
+    {
+        Ok(Ok(response)) => {
+            let txt = response
+                .iter()
+                .next()
+                .and_then(|r| r.txt_data().first())
+                .map(|d| String::from_utf8_lossy(d).into_owned())
+                .unwrap_or_else(|| "<empty>".to_string());
+            if txt == "OK" || txt.starts_with("S") {
+                println!("probe: OK — tunnel server responded (TXT: {:?})", txt);
+            } else {
+                println!("probe: UDP {}:{} is open and answered, but not our tunnel (TXT: {:?})", dns_server, dns_port, txt);
+            }
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if msg.contains("NXDomain") || msg.contains("NoRecordsFound") || msg.contains("no record found") {
+                println!("probe: UDP {}:{} is open (something answered), but got NXDomain.", dns_server, dns_port);
+                println!("       Another DNS is likely on port 53. On the server run:");
+                println!("         sudo ss -ulnp | grep 53   # see what is bound to 53");
+                println!("       Then stop that service or run rust-dns on another port (e.g. 5353) and use -d ... --dns-port 5353 on the client.");
+            } else {
+                eprintln!("probe: server error: {}", e);
+                return Err(e.into());
+            }
+        }
+        Err(_) => {
+            eprintln!("probe: timeout (5s) — no UDP response from {}:{} (port closed or filtered)", dns_server, dns_port);
+            return Err("probe timeout".into());
+        }
+    }
+    Ok(())
+}
+
 // ============== Client ==============
 
 async fn run_client(
@@ -334,17 +501,21 @@ async fn run_client(
     dns_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(listen_addr).await?;
-    println!("DNS tunnel client on {}, {} servers, {} domains (port {})", listen_addr, dns_servers.len(), domains.len(), dns_port);
+    let mut ips = Vec::new();
+    for s in dns_servers {
+        let ip = resolve_dns_server(s).await?;
+        ips.push(ip);
+    }
+    println!("DNS tunnel client on {}, {} servers, {} domains (port {})", listen_addr, ips.len(), domains.len(), dns_port);
 
-    let resolvers: Vec<TokioAsyncResolver> = dns_servers
+    let resolvers: Vec<TokioAsyncResolver> = ips
         .iter()
-        .map(|s| {
-            let ip: std::net::IpAddr = s.parse().unwrap();
+        .map(|ip| {
             TokioAsyncResolver::tokio(
                 ResolverConfig::from_parts(
                     None,
                     vec![],
-                    NameServerConfigGroup::from_ips_clear(&[ip], dns_port, true),
+                    NameServerConfigGroup::from_ips_clear(&[*ip], dns_port, true),
                 ),
                 ResolverOpts::default(),
             )
