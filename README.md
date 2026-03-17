@@ -6,24 +6,40 @@
 
 ---
 
-## One-liner install
+## Install from release (no Rust needed)
+
+Pre-built binaries are published on [Releases](https://github.com/ZeroXShazam/dnspesctor/releases). Download the tarball for your OS/arch, extract, and run:
+
+```bash
+# Example: Linux x86_64
+curl -sSL -o rust-dns.tar.gz https://github.com/ZeroXShazam/dnspesctor/releases/latest/download/rust-dns-linux-x86_64.tar.gz
+tar -xzf rust-dns.tar.gz
+chmod +x rust-dns-linux-x86_64
+./rust-dns-linux-x86_64 --help
+```
+
+Asset names: `rust-dns-linux-x86_64`, `rust-dns-linux-aarch64`, `rust-dns-macos-x86_64`, `rust-dns-macos-aarch64`, `rust-dns-windows-x86_64.exe`.
+
+---
+
+## Build from source
 
 **Requires:** [Rust](https://rustup.rs/) (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 
 From a **clone** of this repo (recommended):
 
 ```bash
-git clone https://github.com/ZeroXShazam/dnspesctor.git && cd dnspesctor && ./scripts/install.sh
+git clone https://github.com/ZeroXShazam/dnspesctor.git && cd dnspesctor && ./install.sh
 ```
 
-Binary will be at `0.x.x/rust-dns` (e.g. `0.1.3/rust-dns`). Optionally install to your PATH:
+Binary will be at `target/release/rust-dns` (or run `./scripts/build-release.sh` to get `0.x.x/rust-dns`). Optionally install to your PATH:
 
 ```bash
-./scripts/install.sh --install
+./install.sh --install
 # Binary in ~/.local/bin/rust-dns (add to PATH if needed)
 ```
 
-**Standalone one-liner** (no clone; fetches install script from the repo):
+**Standalone one-liner** (clone + build from script):
 
 ```bash
 bash -c "$(curl -sSfL https://raw.githubusercontent.com/ZeroXShazam/dnspesctor/main/scripts/install.sh)"

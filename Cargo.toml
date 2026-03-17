@@ -1,6 +1,6 @@
 [package]
 name = "rust-dns"
-version = "0.1.3"
+version = "0.1.0"
 edition = "2021"
 description = "dnspector — TCP-over-DNS tunnel: client listens on TCP, server forwards to destination via DNS TXT"
 
